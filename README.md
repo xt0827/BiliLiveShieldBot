@@ -1,4 +1,4 @@
-# LiveShield-Bot
+# BiliLiveShieldBot
 
 一个基于Python的B站直播间自动管理机器人，支持：
 - 🔍 正则表达式关键词刷屏检测
