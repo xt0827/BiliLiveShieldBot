@@ -4,5 +4,6 @@
 - 正则表达式关键词刷屏检测
 - 自动禁言违规用户
 - 定时公告发送
-
-本项目为https://space.bilibili.com/494650589 @匿名Tian制作欢迎关注
+- 持久化禁言列表
+- web禁言列表查看
+本项目为了https://space.bilibili.com/494650589 @匿名Tian制作欢迎关注
