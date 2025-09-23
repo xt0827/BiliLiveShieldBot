@@ -1,5 +1,5 @@
 import asyncio, requests
-from bilibili_api import live, Credential, sync
+from bilibili_api import live, Credential, Danmaku
 from pathlib import Path
 import yaml
 import os
@@ -9,8 +9,243 @@ from datetime import datetime, timedelta
 import time
 import re
 import json
+import pickle
 from collections import defaultdict, deque
+from flask import Flask, request, render_template_string
+import threading
 
+restart_requested = False
+danmaku_room = None  
+
+class PersistentUnbanManager:
+    def __init__(self, room, config, data_file="banned_users.pkl"):
+        self.room = room
+        self.config = config
+        self.data_file = data_file
+        self.banned_users = self.load_banned_users()
+    
+    def load_banned_users(self):
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'rb') as f:
+                    data = pickle.load(f)
+                    for uid, (name, ban_time_str) in data.items():
+                        data[uid] = (name, datetime.fromisoformat(ban_time_str))
+                    return data
+        except Exception as e:
+            print(f"[错误] 加载禁言列表失败: {e}")
+        return {}
+    
+    def save_banned_users(self):
+        try:
+            save_data = {}
+            for uid, (name, ban_time) in self.banned_users.items():
+                save_data[uid] = (name, ban_time.isoformat())
+            
+            with open(self.data_file, 'wb') as f:
+                pickle.dump(save_data, f)
+        except Exception as e:
+            print(f"[错误] 保存禁言列表失败: {e}")
+    
+    async def ban_user_with_auto_unban(self, user_uid, user_name):
+        ban_hours = self.config.get("禁言时长", 2)
+        result = await self.room.ban_user(uid=user_uid, hour=ban_hours)
+        self.banned_users[user_uid] = (user_name, datetime.now())
+        self.save_banned_users()
+        
+        print(f"[禁言] 已禁言用户: {user_name}，将在{ban_hours}小时后自动解禁")
+        return result
+    
+    async def check_and_unban(self):
+        current_time = datetime.now()
+        users_to_unban = []
+        ban_hours = self.config.get("禁言时长", 2)
+        
+        for user_uid, (user_name, ban_time) in list(self.banned_users.items()):
+            if current_time - ban_time >= timedelta(hours=ban_hours):
+                users_to_unban.append((user_uid, user_name))
+        
+        for user_uid, user_name in users_to_unban:
+            try:
+                await self.room.unban_user(uid=user_uid)
+                print(f"[解禁] 已自动解禁用户: {user_name} (UID: {user_uid})")
+                del self.banned_users[user_uid]
+            except Exception as e:
+                print(f"[解禁错误] 解禁用户 {user_name} 失败: {e}")
+        
+        if users_to_unban:
+            self.save_banned_users()
+    
+    async def sync_banned_status(self):
+        current_time = datetime.now()
+        users_to_remove = []
+        ban_hours = self.config.get("禁言时长", 2)
+        
+        for user_uid, (user_name, ban_time) in list(self.banned_users.items()):
+            if current_time - ban_time >= timedelta(hours=ban_hours):
+                users_to_remove.append((user_uid, user_name))
+        
+        for user_uid, user_name in users_to_remove:
+            try:
+                await self.room.unban_user(uid=user_uid)
+                print(f"[同步解禁] 用户 {user_name} 禁言时间已到，已解禁")
+                del self.banned_users[user_uid]
+            except Exception as e:
+                print(f"[同步解禁错误] 用户 {user_name} 解禁失败: {e}")
+        
+        if users_to_remove:
+            self.save_banned_users()
+
+class SimpleWebConfig:
+    def __init__(self, config_path, port=5000):
+        self.config_path = Path(config_path)
+        self.port = port
+        self.app = Flask(__name__)
+        self.setup_routes()
+        
+    def setup_routes(self):
+        @self.app.route('/')
+        def index():
+            return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>禁言列表</title>
+                <meta charset="utf-8">
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 20px; }
+                    table { border-collapse: collapse; width: 100%; }
+                    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                    th { background-color: #f2f2f2; }
+                    .send-danmaku { margin: 20px 0; padding: 10px; background: #f5f5f5; }
+                </style>
+            </head>
+            <body>
+                <h1>禁言列表管理</h1>
+                <div class="send-danmaku">
+                    <h3>发送弹幕</h3>
+                    <form action="/send_danmaku" method="post">
+                        <input type="text" name="message" placeholder="输入弹幕内容" style="width: 300px; padding: 5px;">
+                        <button type="submit">发送</button>
+                    </form>
+                </div>
+                <p><a href="/banned">查看禁言列表</a> 
+            </body>
+            </html>
+            """
+        
+        @self.app.route('/banned')
+        def banned_users():
+            try:
+                if os.path.exists("banned_users.pkl"):
+                    with open("banned_users.pkl", 'rb') as f:
+                        banned_data = pickle.load(f)
+                    
+                    html = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>当前禁言用户</title>
+                        <meta charset="utf-8">
+                        <style>
+                            body { font-family: Arial, sans-serif; margin: 20px; }
+                            table { border-collapse: collapse; width: 100%; }
+                            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                            th { background-color: #f2f2f2; }
+                        </style>
+                    </head>
+                    <body>
+                        <h1>当前禁言用户</h1>
+                        <table>
+                            <tr>
+                                <th>用户ID</th>
+                                <th>用户名</th>
+                                <th>禁言时间</th>
+                                <th>剩余时间</th>
+                            </tr>
+                    """
+                    
+                    current_time = datetime.now()
+                    for uid, (name, ban_time_str) in banned_data.items():
+                        ban_time = datetime.fromisoformat(ban_time_str)
+                        ban_hours = 2  
+                        remaining = timedelta(hours=ban_hours) - (current_time - ban_time)
+                        remaining_str = str(remaining).split('.')[0] if remaining.total_seconds() > 0 else "已解禁"
+                        
+                        html += f"""
+                            <tr>
+                                <td>{uid}</td>
+                                <td>{name}</td>
+                                <td>{ban_time_str}</td>
+                                <td>{remaining_str}</td>
+                            </tr>
+                        """
+                    
+                    html += """
+                        </table>
+                        <br>
+                        <a href="/">返回首页</a>
+                    </body>
+                    </html>
+                    """
+                    return html
+            except Exception as e:
+                return f"<h1>读取禁言列表失败</h1><p>{e}</p><a href='/'>返回首页</a>"
+            return "<h1>没有禁言用户</h1><a href='/'>返回首页</a>"
+        
+        @self.app.route('/send_danmaku', methods=['POST'])
+        def send_danmaku():
+            message = request.form.get('message', '').strip()
+            if not message:
+                return "<h1>错误</h1><p>弹幕内容不能为空</p><a href='/'>返回首页</a>"
+            
+            global danmaku_room
+            if danmaku_room is None:
+                return "<h1>错误</h1><p>直播间未连接</p><a href='/'>返回首页</a>"
+            
+            try:
+                async def send_async():
+                    try:
+                        danmaku_obj = Danmaku(message)
+                        await danmaku_room.send_danmaku(danmaku_obj)
+                        print(f"[Web弹幕] 已发送: {message}")
+                        return True, None
+                    except Exception as e:
+                        return False, str(e)
+                
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                success, error = loop.run_until_complete(send_async())
+                
+                if success:
+                    return f"<h1>发送成功</h1><p>已发送弹幕: {message}</p><a href='/'>返回首页</a>"
+                else:
+                    return f"<h1>发送失败</h1><p>错误: {error}</p><a href='/'>返回首页</a>"
+                    
+            except Exception as e:
+                return f"<h1>发送失败</h1><p>错误: {e}</p><a href='/'>返回首页</a>"
+        
+        @self.app.route('/restart')
+        def restart():
+            global restart_requested
+            restart_requested = True
+            return "<h1>重启指令已发送</h1><p>程序将在5秒后重启</p><a href='/'>返回首页</a>"
+    
+    def run(self):
+        print(f"禁言列表管理: http://localhost:{self.port}")
+        import logging
+        log = logging.getLogger('werkzeug')
+        log.setLevel(logging.ERROR)
+        self.app.run(host='0.0.0.0', port=self.port, debug=False, use_reloader=False)
+    
+    def start_in_background(self):
+        thread = threading.Thread(target=self.run, daemon=True)
+        thread.start()
+        return thread
 
 class ConsoleToLogHandler:
     def __init__(self, logger, log_level=logging.INFO):
@@ -57,30 +292,16 @@ class SpamDetector:
         self.keyword_patterns = self._compile_keyword_patterns()
 
     def _compile_keyword_patterns(self):
-        """编译关键词的正则表达式模式"""
         keywords = self.config.get("关键词列表", ["喝", "思考", "惊讶", "疑惑"])
         patterns = []
         for keyword in keywords:
             try:
                 pattern = re.compile(keyword)
                 patterns.append(pattern)
-                print(f"[正则编译] 成功编译正则模式: {keyword}")
-            except re.error as e:
+            except re.error:
                 pattern = re.compile(re.escape(keyword))
                 patterns.append(pattern)
-                print(f"[正则编译] 将关键词作为普通文本处理: {keyword}")
         return patterns
-
-    def check_general_spam(self, user_id: str) -> bool:
-        current_time = time.time()
-        user_queue = self.user_messages[user_id]
-        while user_queue and current_time - user_queue[0] > self.time_window:
-            user_queue.popleft()
-        user_queue.append(current_time)
-        if len(user_queue) > self.max_messages:
-            self.spam_warnings[user_id] += 1
-            return True
-        return False
 
     def check_keyword_spam(self, user_id: str, message: str) -> bool:
         matched = False
@@ -98,279 +319,172 @@ class SpamDetector:
             user_queue.popleft()
         user_queue.append(current_time)
         
-        max_keyword_messages = (self.config.get("关键词最大消息数", 3)-1)
+        max_keyword_messages = (self.config.get("关键词最大消息数", 3) - 1)
         if len(user_queue) > max_keyword_messages:
             self.keyword_warnings[user_id] += 1
             return True
         return False
 
     def get_warning_count(self, user_id: str) -> int:
-        return self.spam_warnings.get(user_id, 0) + self.keyword_warnings.get(user_id, 0)
+        return self.keyword_warnings.get(user_id, 0)
 
     def clear_old_entries(self):
         current_time = time.time()
-        users_to_remove = []
         
-        for user_id, timestamps in self.user_messages.items():
-            while timestamps and current_time - timestamps[0] > self.time_window:
-                timestamps.popleft()
-            if not timestamps:
-                users_to_remove.append(user_id)
-        
-        for user_id in users_to_remove:
-            if user_id in self.user_messages:
-                del self.user_messages[user_id]
-            if user_id in self.spam_warnings:
-                del self.spam_warnings[user_id]
-        
-        users_to_remove = []
         for user_id, timestamps in self.keyword_messages.items():
             while timestamps and current_time - timestamps[0] > self.time_window:
                 timestamps.popleft()
-            if not timestamps:
-                users_to_remove.append(user_id)
-        
-        for user_id in users_to_remove:
-            if user_id in self.keyword_messages:
-                del self.keyword_messages[user_id]
-            if user_id in self.keyword_warnings:
-                del self.keyword_warnings[user_id]
 
-class LiveMessageSender:
-    def __init__(self, config, cookies):
-        self.config = config
-        self.cookies = cookies
-        self.room_id = config["room"]
-        self.csrf = config["bili_jct"]
-        self.last_send_time = 0
-    
-    async def send_danmaku(self, message):
-        try:
-            current_time = time.time()
-            if current_time - self.last_send_time < 30:
-                print(f"[频率限制] 请等待 {30 - int(current_time - self.last_send_time)} 秒后再发送")
-                return False
-            
-            headers = {
-                "Referer": f"https://live.bilibili.com/{self.room_id}",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                "Origin": "https://live.bilibili.com",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive"
-            }
-            
-            form_data = {
-                "msg": message,
-                "roomid": self.room_id,
-                "rnd": int(time.time()),
-                "fontsize": 25,
-                "color": 16777215,
-                "mode": 1,
-                "bubble": 0,
-                "room_type": 0,
-                "jumpfrom": 0,
-                "reply_mid": 0,
-                "reply_attr": 0,
-                "reply_uname": "",
-                "replay_dmid": "",
-                "statistics": '{"appId":1,"version":"1.0.0","platform":3}',
-                "csrf": self.csrf,
-                "csrf_token": self.csrf
-            }
-            
-            response = requests.post(
-                "https://api.live.bilibili.com/msg/send",
-                headers=headers,
-                cookies=self.cookies,
-                data=form_data,
-                timeout=10
-            )
-            
-            result = response.json()
-            if result.get("code") == 0:
-                print(f"[弹幕发送成功] {message}")
-                self.last_send_time = current_time
-                return True
-            else:
-                error_msg = result.get('message', '未知错误')
-                print(f"[弹幕发送失败] 错误码: {result.get('code')}, 消息: {error_msg}")
-                return False
-                
-        except Exception as e:
-            print(f"[弹幕发送异常] {e}")
-            return False
-
-class UnbanManager:
-    def __init__(self, room, config, message_sender):
+class AnnouncementManager:
+    def __init__(self, room, config):
         self.room = room
         self.config = config
-        self.message_sender = message_sender
-        self.banned_users = {}
+        self.last_announcement_time = 0
+        self.announcement_interval = config.get("公告发送间隔", 900) 
+        
+    async def send_ban_announcement(self, user_name, ban_hours):
+        announcement = f" {user_name} 因刷屏已被禁言 {ban_hours} 小时，请遵守直播间规则"
+        try:
+            danmaku_obj = Danmaku(announcement)
+            await self.room.send_danmaku(danmaku_obj)
+            print(f"[公告] 已发送封禁提醒: {announcement}")
+        except Exception as e:
+            print(f"[公告错误] 发送封禁提醒失败: {e}")
     
-    async def ban_user_with_auto_unban(self, user_uid, user_name):
-        ban_hours = self.config.get("禁言时长", 2)
-        result = await self.room.ban_user(uid=user_uid, hour=1)
-        self.banned_users[user_uid] = (user_name, datetime.now())
-        
-        print(f"[禁言] 已永久禁言用户: {user_name}，将在{ban_hours}小时后自动解禁")
-        return result
-    
-    async def check_and_unban(self):
-        current_time = datetime.now()
-        users_to_unban = []
-        ban_hours = self.config.get("禁言时长", 2)
-        
-        for user_uid, (user_name, ban_time) in self.banned_users.items():
-            if current_time - ban_time >= timedelta(hours=ban_hours):
-                users_to_unban.append((user_uid, user_name))
-        
-        for user_uid, user_name in users_to_unban:
+    async def send_regular_announcement(self):
+        current_time = time.time()
+        if current_time - self.last_announcement_time >= self.announcement_interval:
+            announcement_content = self.config.get("公告内容", "直播间刷屏自动禁言，2小时自动解除")
             try:
-                await self.room.unban_user(uid=user_uid)
-                print(f"[解禁] 已自动解禁用户: {user_name} (UID: {user_uid})")
-                del self.banned_users[user_uid]
+                danmaku_obj = Danmaku(announcement_content)
+                await self.room.send_danmaku(danmaku_obj)
+                self.last_announcement_time = current_time
+                print(f"[定时公告] 已发送: {announcement_content}")
             except Exception as e:
-                print(f"[解禁错误] 解禁用户 {user_name} 失败: {e}")
+                print(f"[定时公告错误] 发送失败: {e}")
 
 def load_config() -> dict:
     config_path = Path("config.yml")
+    if not config_path.exists():
+        default_config = {
+            "debug": False,
+            "sessdata": "",
+            "bili_jct": "",
+            "buvid3": "",
+            "dedeuserid": "",
+            "ac_time_value": "",
+            "room": "",
+            "uid": "",
+            "刷屏检测时间窗口": 10,
+            "刷屏检测最大消息数": 5,
+            "关键词最大消息数": 3,
+            "禁言时长": 2,
+            "公告内容": "直播间刷屏自动禁言，2小时自动解除",
+            "公告发送间隔": 900,
+            "关键词列表": ["喝", "思考", "惊讶", "疑惑"]
+        }
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(default_config, f, allow_unicode=True, default_flow_style=False)
+    
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 
 async def main():
-    global config
-    config = load_config()
-    cookies = {
-        "buvid3": config["buvid3"],
-        "SESSDATA": config["sessdata"],
-        "bili_jct": config["bili_jct"],
-        "DedeUserID": config["dedeuserid"]
-    }
-    cred = Credential(
-        sessdata=config["sessdata"],
-        bili_jct=config["bili_jct"],
-        buvid3=config["buvid3"],
-        dedeuserid=config["dedeuserid"],
-        ac_time_value=config["ac_time_value"]
-    )
-    room_id = config["room"]
-    up_uid = config["uid"]
-    spam_detector = SpamDetector(config)
-
-    message_sender = LiveMessageSender(config, cookies)
-
-    def ban_user(blacklist_uid, blacklist_name):
-        headers = {
-            "Referer": f"https://live.bilibili.com/{room_id}",
-            "User-Agent": "Mozilla/5.0"
-        }
-        data = {
-            "tuid": blacklist_uid,
-            "anchor_id": up_uid,
-            "spmid": "444.8.0.0",
-            "csrf_token": config["bili_jct"],
-            "csrf": config["bili_jct"],
-            "visit_id": ""
-        }
-        response = requests.post(
-            "https://api.live.bilibili.com/xlive/app-ucenter/v2/xbanned/banned/AddBlack",
-            headers=headers,
-            cookies=cookies,
-            data=data
-        )
-        print(f'成功拉黑水友：{blacklist_name}，uid：{blacklist_uid}')
-        return response.json()
-
-    danmaku = live.LiveDanmaku(
-        room_display_id=room_id,
-        debug=config["debug"],
-        credential=cred
-    )
-    room = live.LiveRoom(room_display_id=room_id, credential=cred)
-    unban_manager = UnbanManager(room, config, message_sender)
-
-    async def handle_spam(user_uid, user_name, is_keyword_spam=False):
-        warning_count = spam_detector.get_warning_count(user_uid)
-        
-        if warning_count == 1:
-            spam_type = "关键词" if is_keyword_spam else "普通"
-            print(f"[刷屏警告] 用户 {user_name} (UID: {user_uid}) {spam_type}刷屏，已警告1次")
-        elif warning_count >= 2:
-            spam_action = config.get("刷屏处理方式", "禁言")
-            if spam_action == "禁言":
-                result = await unban_manager.ban_user_with_auto_unban(user_uid, user_name)
-                spam_type = "关键词" if is_keyword_spam else "普通"
-                print(f"[刷屏处理] 已处理{spam_type}刷屏用户: {user_name}，警告次数: {warning_count}")
-                
-                # 发送封禁通知弹幕
-                ban_message = f"用户 {user_name} 因刷屏已被禁言"
-                await message_sender.send_danmaku(ban_message)
-                
-            elif spam_action == "拉黑":
-                ban_response = ban_user(user_uid, user_name)
-                spam_type = "关键词" if is_keyword_spam else "普通"
-                print(f"[刷屏处理] 已拉黑{spam_type}刷屏用户: {user_name}，警告次数: {warning_count}")
-
-    @danmaku.on('DANMU_MSG')
-    async def on_danmaku(event):
-        user_uid = event["data"]["info"][2][0]
-        user_name = event["data"]["info"][0][15]["user"]["base"]["name"]
-        user_danmaku = event["data"]["info"][1]
-        
-        keyword_spam_detection = config.get("开启关键词刷屏检测", True)
-        if keyword_spam_detection:
-            if spam_detector.check_keyword_spam(user_uid, user_danmaku):
-                await handle_spam(user_uid, user_name, is_keyword_spam=True)
-        
-        general_spam_detection = config.get("开启普通刷屏检测", False)
-        if general_spam_detection:
-            if spam_detector.check_general_spam(user_uid):
-                await handle_spam(user_uid, user_name, is_keyword_spam=False)
-        
-        print(f"[弹幕] {user_name} (UID: {user_uid})：{user_danmaku}")
-
-    async def cleanup_spam_records():
-        while True:
-            await asyncio.sleep(60)
-            spam_detector.clear_old_entries()
-
-    async def auto_unban_check():
-        while True:
-            await asyncio.sleep(300)
-            await unban_manager.check_and_unban()
-
-    async def 定时发送公告():
-        announcement_interval = config.get("公告发送间隔", 600)  
-        announcement_message = config.get("公告内容", "直播间刷屏自动禁言，2小时自动解除")
-        
-        while True:
-            await asyncio.sleep(announcement_interval)
-            try:
-                success = await message_sender.send_danmaku(announcement_message)
-                if success:
-                    print(f"[定时公告] 公告发送: {announcement_message}")
-                else:
-                    print("[定时公告] 公告发送失败")
-            except Exception as e:
-                print(f"[定时公告异常] {e}")
-
-    cleanup_task = asyncio.create_task(cleanup_spam_records())
-    unban_task = asyncio.create_task(auto_unban_check())
-    announcement_task = asyncio.create_task(定时发送公告())
-
+    global config, restart_requested, danmaku_room
+    
+    web_ui = SimpleWebConfig("config.yml", port=5000)
+    web_ui.start_in_background()
+    
     while True:
-        if sync(cred.check_refresh()):
-            sync(cred.refresh())
-        print("正在连接直播间...")
-        await danmaku.connect()
-        await asyncio.sleep(1)
+        try:
+            if restart_requested:
+                print("检测到重启请求，准备重启...")
+                restart_requested = False
+                await asyncio.sleep(5)
+                break
+            
+            config = load_config()
+            cookies = {
+                "buvid3": config["buvid3"],
+                "SESSDATA": config["sessdata"],
+                "bili_jct": config["bili_jct"],
+                "DedeUserID": config["dedeuserid"]
+            }
+            
+            cred = Credential(
+                sessdata=config["sessdata"],
+                bili_jct=config["bili_jct"],
+                buvid3=config["buvid3"],
+                dedeuserid=config["dedeuserid"],
+                ac_time_value=config["ac_time_value"]
+            )
+            
+            room_id = config["room"]
+            spam_detector = SpamDetector(config)
+
+            danmaku = live.LiveDanmaku(
+                room_display_id=room_id,
+                debug=config["debug"],
+                credential=cred
+            )
+            room = live.LiveRoom(room_display_id=room_id, credential=cred)
+            danmaku_room = room  
+            
+            unban_manager = PersistentUnbanManager(room, config)
+            announcement_manager = AnnouncementManager(room, config)
+            
+            await unban_manager.sync_banned_status()
+
+            async def handle_spam(user_uid, user_name):
+                warning_count = spam_detector.get_warning_count(user_uid)
+                
+                if warning_count >= 2:
+                    result = await unban_manager.ban_user_with_auto_unban(user_uid, user_name)
+                    ban_hours = config.get("禁言时长", 2)
+                    await announcement_manager.send_ban_announcement(user_name, ban_hours)
+                    print(f"[刷屏处理] 已处理刷屏用户: {user_name}，警告次数: {warning_count}")
+
+            @danmaku.on('DANMU_MSG')
+            async def on_danmaku(event):
+                user_uid = event["data"]["info"][2][0]
+                user_name = event["data"]["info"][0][15]["user"]["base"]["name"]
+                user_danmaku = event["data"]["info"][1]
+                
+                if spam_detector.check_keyword_spam(user_uid, user_danmaku):
+                    await handle_spam(user_uid, user_name)
+                
+                print(f"[弹幕] {user_name} (UID: {user_uid})：{user_danmaku}")
+
+            async def cleanup_spam_records():
+                while True:
+                    await asyncio.sleep(60)
+                    spam_detector.clear_old_entries()
+
+            async def auto_unban_check():
+                while True:
+                    await asyncio.sleep(300)
+                    await unban_manager.check_and_unban()
+
+            async def regular_announcement():
+                while True:
+                    await asyncio.sleep(60) 
+                    await announcement_manager.send_regular_announcement()
+
+            cleanup_task = asyncio.create_task(cleanup_spam_records())
+            unban_task = asyncio.create_task(auto_unban_check())
+            announcement_task = asyncio.create_task(regular_announcement())
+
+            while not restart_requested:
+                await danmaku.connect()
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            print(f"主循环错误: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     logger = setup_universal_logging()
-    try:
+    while True:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n已停止监听")
+        print("程序重启中...")
+        time.sleep(2)
