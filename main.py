@@ -13,16 +13,20 @@ import pickle
 from collections import defaultdict, deque
 from flask import Flask, request, render_template_string
 import threading
+from queue import Queue
 
 restart_requested = False
-danmaku_room = None  
+danmaku_room = None
+danmaku_messages = Queue(maxsize=1000)
 
 class PersistentUnbanManager:
-    def __init__(self, room, config, data_file="banned_users.pkl"):
+    def __init__(self, room, config, data_file="banned_users.pkl", ban_history_file="ban_history.json"):
         self.room = room
         self.config = config
         self.data_file = data_file
+        self.ban_history_file = ban_history_file
         self.banned_users = self.load_banned_users()
+        self.ban_history = self.load_ban_history()
     
     def load_banned_users(self):
         try:
@@ -36,6 +40,15 @@ class PersistentUnbanManager:
             print(f"[错误] 加载禁言列表失败: {e}")
         return {}
     
+    def load_ban_history(self):
+        try:
+            if os.path.exists(self.ban_history_file):
+                with open(self.ban_history_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"[错误] 加载封禁历史失败: {e}")
+        return []
+    
     def save_banned_users(self):
         try:
             save_data = {}
@@ -47,11 +60,30 @@ class PersistentUnbanManager:
         except Exception as e:
             print(f"[错误] 保存禁言列表失败: {e}")
     
+    def save_ban_history(self):
+        try:
+            with open(self.ban_history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.ban_history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[错误] 保存封禁历史失败: {e}")
+    
     async def ban_user_with_auto_unban(self, user_uid, user_name):
         ban_hours = self.config.get("禁言时长", 2)
         result = await self.room.ban_user(uid=user_uid, hour=ban_hours)
-        self.banned_users[user_uid] = (user_name, datetime.now())
+        ban_time = datetime.now()
+        self.banned_users[user_uid] = (user_name, ban_time)
         self.save_banned_users()
+        
+        ban_record = {
+            "user_uid": user_uid,
+            "user_name": user_name,
+            "ban_time": ban_time.isoformat(),
+            "ban_hours": ban_hours,
+            "unban_time": (ban_time + timedelta(hours=ban_hours)).isoformat(),
+            "reason": "关键词刷屏"
+        }
+        self.ban_history.append(ban_record)
+        self.save_ban_history()
         
         print(f"[禁言] 已禁言用户: {user_name}，将在{ban_hours}小时后自动解禁")
         return result
@@ -70,6 +102,14 @@ class PersistentUnbanManager:
                 await self.room.unban_user(uid=user_uid)
                 print(f"[解禁] 已自动解禁用户: {user_name} (UID: {user_uid})")
                 del self.banned_users[user_uid]
+                
+                for record in self.ban_history:
+                    if record["user_uid"] == user_uid and "actual_unban_time" not in record:
+                        record["actual_unban_time"] = current_time.isoformat()
+                        record["status"] = "已解禁"
+                        break
+                self.save_ban_history()
+                
             except Exception as e:
                 print(f"[解禁错误] 解禁用户 {user_name} 失败: {e}")
         
@@ -88,13 +128,51 @@ class PersistentUnbanManager:
         for user_uid, user_name in users_to_remove:
             try:
                 await self.room.unban_user(uid=user_uid)
-                print(f"[同步解禁] 用户 {user_name} 禁言时间已到，已解禁")
+                print(f"[解禁] 用户 {user_name} 禁言时间已到，已解禁")
                 del self.banned_users[user_uid]
+                
+                for record in self.ban_history:
+                    if record["user_uid"] == user_uid and "actual_unban_time" not in record:
+                        record["actual_unban_time"] = current_time.isoformat()
+                        record["status"] = "已解禁"
+                        break
+                self.save_ban_history()
+                
             except Exception as e:
-                print(f"[同步解禁错误] 用户 {user_name} 解禁失败: {e}")
+                print(f"[解禁错误] 用户 {user_name} 解禁失败: {e}")
         
         if users_to_remove:
             self.save_banned_users()
+    
+    def get_ban_history(self, limit=100):
+        return self.ban_history[-limit:][::-1]
+    
+    def get_ban_ranking(self, limit=20):
+        ban_count = defaultdict(int)
+        total_ban_hours = defaultdict(int)
+        last_ban_time = {}
+        
+        for record in self.ban_history:
+            user_uid = record["user_uid"]
+            user_name = record["user_name"]
+            ban_hours = record["ban_hours"]
+            
+            ban_count[user_uid] += 1
+            total_ban_hours[user_uid] += ban_hours
+            last_ban_time[user_uid] = record["ban_time"]
+        
+        ranking = []
+        for user_uid, count in ban_count.items():
+            ranking.append({
+                "user_uid": user_uid,
+                "user_name": next((r["user_name"] for r in self.ban_history if r["user_uid"] == user_uid), "未知用户"),
+                "ban_count": count,
+                "total_hours": total_ban_hours[user_uid],
+                "last_ban_time": last_ban_time[user_uid]
+            })
+        
+        ranking.sort(key=lambda x: x["ban_count"], reverse=True)
+        return ranking[:limit]
 
 class SimpleWebConfig:
     def __init__(self, config_path, port=5000):
@@ -110,7 +188,7 @@ class SimpleWebConfig:
             <!DOCTYPE html>
             <html>
             <head>
-                <title>禁言列表</title>
+                <title>直播间管理</title>
                 <meta charset="utf-8">
                 <style>
                     body { font-family: Arial, sans-serif; margin: 20px; }
@@ -118,10 +196,17 @@ class SimpleWebConfig:
                     th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
                     th { background-color: #f2f2f2; }
                     .send-danmaku { margin: 20px 0; padding: 10px; background: #f5f5f5; }
+                    .nav { margin: 20px 0; }
+                    .nav a { margin-right: 15px; text-decoration: none; color: #007bff; }
+                    .nav a:hover { text-decoration: underline; }
+                    .rank-1 { background-color: #fffacd; }
+                    .rank-2 { background-color: #f0f0f0; }
+                    .rank-3 { background-color: #ffd700; }
+                    .ranking-table td { text-align: center; }
                 </style>
             </head>
             <body>
-                <h1>禁言列表管理</h1>
+                <h1>直播间管理</h1>
                 <div class="send-danmaku">
                     <h3>发送弹幕</h3>
                     <form action="/send_danmaku" method="post">
@@ -129,7 +214,11 @@ class SimpleWebConfig:
                         <button type="submit">发送</button>
                     </form>
                 </div>
-                <p><a href="/banned">查看禁言列表</a> 
+                <div class="nav">
+                    <a href="/banned">当前禁言用户</a>
+                    <a href="/ban_history">封禁记录</a>
+                    <a href="/ban_ranking">封禁排行榜</a>
+                </div>
             </body>
             </html>
             """
@@ -168,7 +257,7 @@ class SimpleWebConfig:
                     current_time = datetime.now()
                     for uid, (name, ban_time_str) in banned_data.items():
                         ban_time = datetime.fromisoformat(ban_time_str)
-                        ban_hours = 2  
+                        ban_hours = 2
                         remaining = timedelta(hours=ban_hours) - (current_time - ban_time)
                         remaining_str = str(remaining).split('.')[0] if remaining.total_seconds() > 0 else "已解禁"
                         
@@ -192,6 +281,177 @@ class SimpleWebConfig:
             except Exception as e:
                 return f"<h1>读取禁言列表失败</h1><p>{e}</p><a href='/'>返回首页</a>"
             return "<h1>没有禁言用户</h1><a href='/'>返回首页</a>"
+        
+        @self.app.route('/ban_history')
+        def ban_history():
+            try:
+                if os.path.exists("ban_history.json"):
+                    with open("ban_history.json", 'r', encoding='utf-8') as f:
+                        history_data = json.load(f)
+                    
+                    html = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>封禁记录</title>
+                        <meta charset="utf-8">
+                        <style>
+                            body { font-family: Arial, sans-serif; margin: 20px; }
+                            table { border-collapse: collapse; width: 100%; }
+                            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                            th { background-color: #f2f2f2; }
+                            .status-banned { color: #dc3545; font-weight: bold; }
+                            .status-unbanned { color: #28a745; font-weight: bold; }
+                        </style>
+                    </head>
+                    <body>
+                        <h1>封禁记录</h1>
+                        <table>
+                            <tr>
+                                <th>用户ID</th>
+                                <th>用户名</th>
+                                <th>禁言时间</th>
+                                <th>解禁时间</th>
+                                <th>禁言时长</th>
+                                <th>状态</th>
+                                <th>原因</th>
+                            </tr>
+                    """
+                    
+                    for record in history_data:
+                        user_uid = record.get("user_uid", "")
+                        user_name = record.get("user_name", "")
+                        ban_time = record.get("ban_time", "")[:19]
+                        unban_time = record.get("unban_time", "")[:19]
+                        actual_unban_time = record.get("actual_unban_time", "")
+                        if actual_unban_time:
+                            actual_unban_time = actual_unban_time[:19]
+                        ban_hours = record.get("ban_hours", 2)
+                        reason = record.get("reason", "关键词刷屏")
+                        
+                        status = "已解禁" if record.get("actual_unban_time") else "禁言中"
+                        status_class = "status-unbanned" if status == "已解禁" else "status-banned"
+                        display_unban_time = actual_unban_time if actual_unban_time else unban_time
+                        
+                        html += f"""
+                            <tr>
+                                <td>{user_uid}</td>
+                                <td>{user_name}</td>
+                                <td>{ban_time}</td>
+                                <td>{display_unban_time}</td>
+                                <td>{ban_hours}小时</td>
+                                <td class="{status_class}">{status}</td>
+                                <td>{reason}</td>
+                            </tr>
+                        """
+                    
+                    html += """
+                        </table>
+                        <br>
+                        <a href="/">返回首页</a>
+                    </body>
+                    </html>
+                    """
+                    return html
+            except Exception as e:
+                return f"<h1>读取封禁记录失败</h1><p>{e}</p><a href='/'>返回首页</a>"
+            return "<h1>没有封禁记录</h1><a href='/'>返回首页</a>"
+        
+        @self.app.route('/ban_ranking')
+        def ban_ranking():
+            try:
+                if os.path.exists("ban_history.json"):
+                    with open("ban_history.json", 'r', encoding='utf-8') as f:
+                        history_data = json.load(f)
+                    
+                    ban_count = defaultdict(int)
+                    total_ban_hours = defaultdict(int)
+                    last_ban_time = {}
+                    
+                    for record in history_data:
+                        user_uid = record["user_uid"]
+                        user_name = record["user_name"]
+                        ban_hours = record["ban_hours"]
+                        
+                        ban_count[user_uid] += 1
+                        total_ban_hours[user_uid] += ban_hours
+                        last_ban_time[user_uid] = record["ban_time"]
+                    
+                    ranking = []
+                    for user_uid, count in ban_count.items():
+                        ranking.append({
+                            "user_uid": user_uid,
+                            "user_name": next((r["user_name"] for r in history_data if r["user_uid"] == user_uid), "未知用户"),
+                            "ban_count": count,
+                            "total_hours": total_ban_hours[user_uid],
+                            "last_ban_time": last_ban_time[user_uid][:19]
+                        })
+                    
+                    ranking.sort(key=lambda x: x["ban_count"], reverse=True)
+                    
+                    html = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>封禁排行榜</title>
+                        <meta charset="utf-8">
+                        <style>
+                            body { font-family: Arial, sans-serif; margin: 20px; }
+                            table { border-collapse: collapse; width: 100%; }
+                            th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+                            th { background-color: #f2f2f2; }
+                            .rank-1 { background-color: #ffd700; font-weight: bold; }
+                            .rank-2 { background-color: #c0c0c0; font-weight: bold; }
+                            .rank-3 { background-color: #cd7f32; font-weight: bold; }
+                            .ranking-table td { text-align: center; }
+                            .rank-number { font-weight: bold; color: #333; }
+                        </style>
+                    </head>
+                    <body>
+                        <h1>封禁排行榜</h1>
+                        <table class="ranking-table">
+                            <tr>
+                                <th>排名</th>
+                                <th>用户ID</th>
+                                <th>用户名</th>
+                                <th>封禁次数</th>
+                                <th>总禁言时长(小时)</th>
+                                <th>最后封禁时间</th>
+                            </tr>
+                    """
+                    
+                    for i, user in enumerate(ranking[:20], 1):
+                        rank_class = ""
+                        if i == 1:
+                            rank_class = "rank-1"
+                        elif i == 2:
+                            rank_class = "rank-2"
+                        elif i == 3:
+                            rank_class = "rank-3"
+                        
+                        html += f"""
+                            <tr class="{rank_class}">
+                                <td class="rank-number">{i}</td>
+                                <td>{user['user_uid']}</td>
+                                <td>{user['user_name']}</td>
+                                <td>{user['ban_count']}</td>
+                                <td>{user['total_hours']}</td>
+                                <td>{user['last_ban_time']}</td>
+                            </tr>
+                        """
+                    
+                    html += """
+                        </table>
+                        <br>
+                        <p>总计封禁用户数: """ + str(len(ranking)) + """</p>
+                        <a href="/">返回首页</a>
+                    </body>
+                    </html>
+                    """
+                    return html
+            except Exception as e:
+                return f"<h1>读取封禁记录失败</h1><p>{e}</p><a href='/'>返回首页</a>"
+            return "<h1>没有封禁记录</h1><a href='/'>返回首页</a>"
         
         @self.app.route('/send_danmaku', methods=['POST'])
         def send_danmaku():
@@ -228,15 +488,9 @@ class SimpleWebConfig:
                     
             except Exception as e:
                 return f"<h1>发送失败</h1><p>错误: {e}</p><a href='/'>返回首页</a>"
-        
-        @self.app.route('/restart')
-        def restart():
-            global restart_requested
-            restart_requested = True
-            return "<h1>重启指令已发送</h1><p>程序将在5秒后重启</p><a href='/'>返回首页</a>"
     
     def run(self):
-        print(f"禁言列表管理: http://localhost:{self.port}")
+        print(f"直播间管理: http://localhost:{self.port}")
         import logging
         log = logging.getLogger('werkzeug')
         log.setLevel(logging.ERROR)
@@ -340,10 +594,10 @@ class AnnouncementManager:
         self.room = room
         self.config = config
         self.last_announcement_time = 0
-        self.announcement_interval = config.get("公告发送间隔", 900) 
+        self.announcement_interval = config.get("公告发送间隔", 900)
         
     async def send_ban_announcement(self, user_name, ban_hours):
-        announcement = f" {user_name} 因刷屏已被禁言 {ban_hours} 小时，请遵守直播间规则"
+        announcement = f"用户 {user_name} 因刷屏已被禁言 {ban_hours} 小时，请遵守直播间规则"
         try:
             danmaku_obj = Danmaku(announcement)
             await self.room.send_danmaku(danmaku_obj)
@@ -428,7 +682,7 @@ async def main():
                 credential=cred
             )
             room = live.LiveRoom(room_display_id=room_id, credential=cred)
-            danmaku_room = room  
+            danmaku_room = room
             
             unban_manager = PersistentUnbanManager(room, config)
             announcement_manager = AnnouncementManager(room, config)
@@ -454,6 +708,16 @@ async def main():
                     await handle_spam(user_uid, user_name)
                 
                 print(f"[弹幕] {user_name} (UID: {user_uid})：{user_danmaku}")
+                
+                danmaku_data = {
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                    'user': user_name,
+                    'message': user_danmaku
+                }
+                
+                if danmaku_messages.full():
+                    danmaku_messages.get()
+                danmaku_messages.put(danmaku_data)
 
             async def cleanup_spam_records():
                 while True:
@@ -467,7 +731,7 @@ async def main():
 
             async def regular_announcement():
                 while True:
-                    await asyncio.sleep(60) 
+                    await asyncio.sleep(60)
                     await announcement_manager.send_regular_announcement()
 
             cleanup_task = asyncio.create_task(cleanup_spam_records())
