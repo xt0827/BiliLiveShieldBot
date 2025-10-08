@@ -386,7 +386,7 @@ class SimpleWebConfig:
         </div>
 
         <div class="status-bar">
-            <div id="lastUpdate">最后更新: <span id="updateTime">加载中...</span></div><span class="heimu" title="你知道的太多了">其实我是人类</span>
+            <div id="lastUpdate">最后更新: <span id="updateTime">加载中...</span></div>
         </div>
 
         <div class="nav">
