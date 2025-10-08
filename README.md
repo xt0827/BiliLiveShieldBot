@@ -10,3 +10,4 @@
 - 封禁次数排行榜
   
 本项目为了https://space.bilibili.com/494650589 @匿名Tian制作欢迎关注
+本项目目前有依旧少量bug,正在准备使用rust重写
